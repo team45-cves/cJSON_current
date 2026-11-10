@@ -1,0 +1,235 @@
+# SBOM scan with RESOLVE, as used by another project.
+#
+# This file belongs in a project that uses RESOLVE, not in the resolve
+# repository itself: for example a fork of cJSON or curl kept for real-world
+# testing. Copy it to that project as .github/workflows/sbom-scan.yml.
+#
+#   1. scan     builds this project with CMake, which writes an SPDX SBOM of
+#               what it installs; builds the RESOLVE image; scans the SBOM
+#               with the SBOM Scan action; and uploads the SBOM,
+#               vulnerabilities.json and the per-CVE files.
+#   2. per-cve  starts one job per CVE found, ready for the next stage
+#               (input synthesis). Skipped when no CVEs are found.
+#
+# Before using it, set the project settings in "env:" below. The SBOM comes
+# from a real CMake build of this project: CMake (4.3 and newer) can write an
+# SPDX SBOM of the targets it installs. The settings below are for cJSON.
+
+name: SBOM scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # New CVEs are published even when the code doesn't change, so scan weekly
+  # as well (Mondays, 06:00 UTC).
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      llm-provider:
+        description: "LLM that fills in the affected file and function"
+        type: choice
+        options: [none, claude, gemini, ollama, opencode]
+        default: none
+      min-score:
+        description: "Minimum CVSS v3 base score (empty = no minimum)"
+        default: ""
+      fail-on-cves:
+        description: "Fail the run if any CVEs are found"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # Which version of RESOLVE to build. Keep it the same as the @ref on the
+  # "uses: Team45-CVEs/resolve/..." line below; GitHub doesn't allow
+  # variables in "uses:", so the two can't share one setting. For real-world
+  # testing, set both to the release candidate's commit SHA.
+  RESOLVE_REF: main
+  IMAGE: resolve_ci:local
+  # Where the SBOM from the build is copied for the scan, relative to the
+  # repository root.
+  SBOM_PATH: sbom.spdx.json
+
+  # --- CMake build ------------------------------------------------------------
+  # SBOM generation is experimental in CMake and is switched on with a code
+  # that changes between CMake versions, so change these two together. To find
+  # the code for another version, configure any project with install(SBOM)
+  # and no code: CMake's error names the variable, and the code is listed in
+  # that version's source under Help/dev/experimental.rst.
+  CMAKE_VERSION: "4.4.4"
+  CMAKE_SBOM_GATE: "2d856d6d-53e8-488b-a17f-d486d2cac317"
+  # The project's build options (from its README). Tests are left out because
+  # they aren't part of what's installed.
+  CMAKE_OPTIONS: "-DCMAKE_BUILD_TYPE=Release -DENABLE_CJSON_TEST=Off"
+  # What the SBOM covers: the export set(s) the project installs with
+  # install(TARGETS ... EXPORT <name>). cJSON's is "cjson"; add "cjson_utils"
+  # if you also turn on -DENABLE_CJSON_UTILS=On.
+  SBOM_EXPORTS: "cjson"
+  # The SBOM's name, and a canonical URL for the project. The version comes
+  # from the project's own project(VERSION ...) call.
+  SBOM_NAME: "cJSON"
+  SBOM_PACKAGE_URL: "https://github.com/team45-cves/cJSON_current"
+
+  OUTPUT_DIR: sbom-out
+  # Runs that aren't started by hand have no inputs, so they use "none".
+  LLM_PROVIDER: ${{ inputs.llm-provider || 'none' }}
+
+jobs:
+  scan:
+    name: Scan SBOM
+    runs-on: ubuntu-latest
+    # Passed to the per-cve job.
+    outputs:
+      cve-count: ${{ steps.sbom.outputs.cve-count }}
+      cve-files: ${{ steps.sbom.outputs.cve-files }}
+    steps:
+      - name: Check out this project
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The runner's own CMake is too old for SBOMs, so install the pinned one.
+      - name: Install CMake ${{ env.CMAKE_VERSION }}
+        run: |
+          python -m pip install --quiet "cmake==$CMAKE_VERSION"
+          cmake --version
+
+      # Builds and installs the project as its README describes, outside the
+      # workspace (the scan action mounts the whole workspace, so it should
+      # hold only the project). The project's CMakeLists.txt isn't changed:
+      # CMAKE_PROJECT_INCLUDE loads one extra file after its project() call,
+      # which adds an install(SBOM) rule once the project's own install rules
+      # are defined. Installing then writes the SBOM next to the libraries.
+      - name: Build with CMake and generate the SBOM
+        run: |
+          build="$RUNNER_TEMP/build"
+          install="$RUNNER_TEMP/install"
+          cat > "$RUNNER_TEMP/sbom.cmake" <<'EOF'
+          cmake_language(DEFER DIRECTORY "${CMAKE_SOURCE_DIR}" CALL
+            install SBOM "${SBOM_NAME}" EXPORTS ${SBOM_EXPORTS}
+            PACKAGE_URL "${SBOM_PACKAGE_URL}")
+          EOF
+
+          # CMAKE_OPTIONS holds several options, so it's deliberately not quoted.
+          # shellcheck disable=SC2086
+          cmake -S . -B "$build" $CMAKE_OPTIONS \
+            -DCMAKE_INSTALL_PREFIX="$install" \
+            -DCMAKE_EXPERIMENTAL_GENERATE_SBOM="$CMAKE_SBOM_GATE" \
+            -DCMAKE_PROJECT_INCLUDE="$RUNNER_TEMP/sbom.cmake" \
+            -DSBOM_NAME="$SBOM_NAME" \
+            -DSBOM_EXPORTS="${SBOM_EXPORTS// /;}" \
+            -DSBOM_PACKAGE_URL="$SBOM_PACKAGE_URL"
+          cmake --build "$build" --parallel
+          cmake --install "$build"
+
+          sbom=$(find "$install" -name "$SBOM_NAME.spdx.json" -print -quit)
+          if [ -z "$sbom" ]; then
+            echo "::error title=SBOM::CMake didn't write an SBOM. Check that SBOM_EXPORTS matches the project's install(TARGETS ... EXPORT) name."
+            exit 1
+          fi
+          # A wrong export name doesn't stop CMake: it writes an SBOM with no
+          # packages in it, which would scan clean. Treat that as an error.
+          if ! python -c 'import json, sys; graph = json.load(open(sys.argv[1]))["@graph"]; sys.exit(not any(node.get("rootElement") for node in graph))' "$sbom"; then
+            echo "::error title=SBOM::CMake wrote an SBOM with no packages. Check that SBOM_EXPORTS matches the project's install(TARGETS ... EXPORT) name."
+            exit 1
+          fi
+          mkdir -p "$(dirname "$SBOM_PATH")"
+          cp "$sbom" "$SBOM_PATH"
+          echo "SBOM written by CMake: ${sbom#"$install"/} -> $SBOM_PATH"
+
+      # The action runs an image built by an earlier step, so build it from
+      # the resolve repository. AI_BACKEND=none skips the AI command-line
+      # tools; build with the matching backend if the chosen llm-provider
+      # needs its CLI inside the image.
+      - name: Check out RESOLVE
+        uses: actions/checkout@v4
+        with:
+          repository: Team45-CVEs/resolve
+          ref: ${{ env.RESOLVE_REF }}
+          path: .resolve
+          # If the resolve repository is private, give a token that can read it:
+          # token: ${{ secrets.RESOLVE_READ_TOKEN }}
+
+      - name: Build the RESOLVE image
+        run: docker build -f .resolve/CI-CD/docker/pipeline/Dockerfile --build-arg AI_BACKEND=none -t "$IMAGE" .resolve/CI-CD
+
+      # The action mounts the whole workspace, so remove RESOLVE's source to
+      # leave only this project there. The image keeps everything it needs.
+      - name: Remove the RESOLVE checkout
+        run: rm -rf .resolve
+
+      - name: Scan the SBOM
+        id: sbom
+        uses: Team45-CVEs/resolve/CI-CD/actions/sbom@main
+        with:
+          image: ${{ env.IMAGE }}
+          sbom-path: ${{ env.SBOM_PATH }}
+          output-dir: ${{ env.OUTPUT_DIR }}
+          llm-provider: ${{ env.LLM_PROVIDER }}
+          # Only claude and gemini need a key. Store them as secrets in this
+          # project; pull requests from forks get none, so they use "none".
+          api-key: ${{ env.LLM_PROVIDER == 'claude' && secrets.ANTHROPIC_API_KEY || env.LLM_PROVIDER == 'gemini' && secrets.GEMINI_API_KEY || '' }}
+          min-score: ${{ inputs.min-score }}
+          filter-rejected: "true"
+          filter-disputed: "false"
+          filter-deferred: "false"
+
+      # Outputs are passed through env, never pasted into the script, so
+      # unusual characters can't change the command.
+      - name: Report the results
+        env:
+          CVE_COUNT: ${{ steps.sbom.outputs.cve-count }}
+          VULNERABILITIES: ${{ steps.sbom.outputs.vulnerabilities-path }}
+          FAIL_ON_CVES: ${{ inputs.fail-on-cves || false }}
+        run: |
+          echo "Found ${CVE_COUNT:-0} CVEs. Details: $VULNERABILITIES"
+          if [ "$FAIL_ON_CVES" = "true" ] && [ "${CVE_COUNT:-0}" -gt 0 ]; then
+            echo "::error title=SBOM scan::${CVE_COUNT} CVEs found in $SBOM_PATH"
+            exit 1
+          fi
+
+      - name: Upload the scan results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-results
+          path: |
+            ${{ env.OUTPUT_DIR }}/
+            ${{ env.SBOM_PATH }}
+          if-no-files-found: warn
+
+  per-cve:
+    name: ${{ matrix.cve-file }}
+    needs: scan
+    # A matrix can't be empty, so skip this job when nothing was found.
+    if: needs.scan.outputs.cve-count != '' && needs.scan.outputs.cve-count != '0'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false   # one CVE failing doesn't cancel the others
+      max-parallel: 4
+      matrix:
+        # cve-files is a JSON list such as ["cves/CVE-2026-34085.json"].
+        cve-file: ${{ fromJSON(needs.scan.outputs.cve-files) }}
+    steps:
+      - name: Download the scan results
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-results
+          path: ${{ env.OUTPUT_DIR }}
+
+      # Replace this with the input-synthesis action. Each job runs on a fresh
+      # runner, so that action will need the RESOLVE image again: check out
+      # and build it here as in the scan job, or docker save it in the scan
+      # job and load it from an artifact.
+      - name: Input synthesis (placeholder)
+        env:
+          CVE_FILE: ${{ env.OUTPUT_DIR }}/${{ matrix.cve-file }}
+        run: |
+          echo "Next stage would run on $CVE_FILE"
+          head -c 1000 "$CVE_FILE"
